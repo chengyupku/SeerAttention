@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import tilelang
 from tilelang.autotuner import *
 import tilelang.language as T
+from tilelang.carver.arch import driver
+from tilelang.engine.callback import register_cuda_postproc_callback
 from einops import rearrange, einsum
 import argparse
 import time
@@ -29,7 +31,7 @@ def flashattn(batch, heads, heads_kv, dim, dim_v, fuse=False):
         shape_o = [batch, heads, dim_v]
         part_shape = [batch, heads, num_split, dim_v]
         valid_block_H = min(block_H, kv_group_num)
-        sm_num = 132
+        sm_num = driver.get_num_sms()
 
         @T.macro
         def flash_attn_split(
@@ -188,15 +190,15 @@ def flashattn(batch, heads, heads_kv, dim, dim_v, fuse=False):
             combine(glse, Output_partial, Output)
 
         @T.macro
-        def flash_attn_split_fuse(
+        def flash_attn_fused(
                 Q: T.Tensor(shape_q, dtype),
                 K: T.Tensor(shape_k, dtype),
                 V: T.Tensor(shape_v, dtype),
                 block_indices: T.Tensor(shape_indices, "int32"),
                 cache_seqlens: T.Tensor([batch], "int32"),
-                # actual_num_blocks: T.Tensor([batch], "int32"),
                 glse: T.Tensor([batch, heads, num_split], accum_dtype),
                 Output_partial: T.Tensor(part_shape, accum_dtype),
+                Output: T.Tensor(shape_o, dtype),
         ):
             with T.Kernel(sm_num, threads=threads) as (block_idx):
                 Q_shared = T.alloc_shared([block_H, dim], dtype)
@@ -213,16 +215,26 @@ def flashattn(batch, heads, heads_kv, dim, dim_v, fuse=False):
                 scores_sum = T.alloc_fragment([block_H], accum_dtype)
                 logsum = T.alloc_fragment([block_H], accum_dtype)
                 has_valid_block = T.alloc_var("bool")
+                po_local = T.alloc_fragment([dim_v], accum_dtype)
+                o_accum_local = T.alloc_fragment([dim_v], accum_dtype)
+                lse_local_split = T.alloc_local([1], accum_dtype)
+                lse_logsum_local = T.alloc_local([1], accum_dtype)
+                lse_max_local = T.alloc_local([1], accum_dtype)
+                scale_local = T.alloc_local([1], accum_dtype)
+                max_split = T.alloc_local([1], "int32")
+
+                T.annotate_layout({
+                    lse_logsum_local:
+                        T.Fragment(lse_logsum_local.shape, forward_thread_fn=lambda i: i),
+                })
 
                 waves = T.ceildiv((batch * (heads // valid_block_H) * num_split), sm_num)
                 for wave in T.serial(waves):
-                    bid = (sm_num * wave + block_idx) // (heads // heads_kv)
-                    hid = ((sm_num * wave + block_idx) // num_split) % (heads // heads_kv)
+                    bid = (sm_num * wave + block_idx) // (heads // valid_block_H)
+                    hid = ((sm_num * wave + block_idx) // num_split) % (heads // valid_block_H)
                     sid = (sm_num * wave + block_idx) % num_split
                     cur_kv_head = hid // (kv_group_num // valid_block_H)
-                    if bid < batch and hid < heads and sid < num_split:
-                    # TODO: change this to the actual condition
-                    # if True:
+                    if bid < batch and hid * valid_block_H < heads and sid < num_split:
                         T.copy(Q[bid, hid * valid_block_H:hid * valid_block_H + block_H, :], Q_shared)
                         T.fill(acc_o, 0)
                         T.fill(logsum, 0)
@@ -284,51 +296,36 @@ def flashattn(batch, heads, heads_kv, dim, dim_v, fuse=False):
                         for i, j in T.Parallel(block_H, dim_v):
                             if i < valid_block_H:
                                 Output_partial[bid, hid * valid_block_H + i, sid, j] = acc_o[i, j]
+                
+                T.sync_grid()
+                for wave in T.serial(T.ceildiv(batch * heads, sm_num)):
+                    bid = (sm_num * wave + block_idx) % batch
+                    hid = (sm_num * wave + block_idx) // batch
+                    if bid < batch and hid < heads:
+                        T.clear(lse_logsum_local)
+                        T.clear(o_accum_local)
+                        lse_max_local[0] = -T.infinity(accum_dtype)
+                        for k in T.serial(num_split):
+                            lse_local_split[0] = glse[bid, hid, k]
+                            if (lse_local_split[0] != 0):
+                                max_split[0] = k
+                                lse_max_local[0] = T.max(lse_max_local[0], glse[bid, hid, k])
 
-        @T.macro
-        def combine_fuse(
-                glse: T.Tensor([batch, heads, num_split], accum_dtype),
-                Output_partial: T.Tensor(part_shape, accum_dtype),
-                Output: T.Tensor(shape_o, dtype),
-        ):
-            with T.Kernel(heads, batch, threads=128) as (by, bz):
-                po_local = T.alloc_fragment([dim_v], accum_dtype)
-                o_accum_local = T.alloc_fragment([dim_v], accum_dtype)
-                lse_local_split = T.alloc_local([1], accum_dtype)
-                lse_logsum_local = T.alloc_local([1], accum_dtype)
-                lse_max_local = T.alloc_local([1], accum_dtype)
-                scale_local = T.alloc_local([1], accum_dtype)
-                max_split = T.alloc_local([1], "int32")
-
-                T.annotate_layout({
-                    lse_logsum_local:
-                        T.Fragment(lse_logsum_local.shape, forward_thread_fn=lambda i: i),
-                })
-
-                T.clear(lse_logsum_local)
-                T.clear(o_accum_local)
-                lse_max_local[0] = -T.infinity(accum_dtype)
-                for k in T.serial(num_split):
-                    lse_local_split[0] = glse[bz, by, k]
-                    if (lse_local_split[0] != 0):
-                        max_split[0] = k
-                        lse_max_local[0] = T.max(lse_max_local[0], glse[bz, by, k])
-
-                for k in T.Pipelined(num_split, num_stages=1):
-                    if k <= max_split[0]:
-                        lse_local_split[0] = glse[bz, by, k]
-                        lse_logsum_local[0] += T.exp2(lse_local_split[0] - lse_max_local[0])
-                lse_logsum_local[0] = T.log2(lse_logsum_local[0]) + lse_max_local[0]
-                for k in T.serial(num_split):
-                    if k <= max_split[0]:
+                        for k in T.Pipelined(num_split, num_stages=1):
+                            if k <= max_split[0]:
+                                lse_local_split[0] = glse[bid, hid, k]
+                                lse_logsum_local[0] += T.exp2(lse_local_split[0] - lse_max_local[0])
+                        lse_logsum_local[0] = T.log2(lse_logsum_local[0]) + lse_max_local[0]
+                        for k in T.serial(num_split):
+                            if k <= max_split[0]:
+                                for i in T.Parallel(dim_v):
+                                    po_local[i] = Output_partial[bid, hid, k, i]
+                                lse_local_split[0] = glse[bid, hid, k]
+                                scale_local[0] = T.exp2(lse_local_split[0] - lse_logsum_local[0])
+                                for i in T.Parallel(dim_v):
+                                    o_accum_local[i] += po_local[i] * scale_local[0]
                         for i in T.Parallel(dim_v):
-                            po_local[i] = Output_partial[bz, by, k, i]
-                        lse_local_split[0] = glse[bz, by, k]
-                        scale_local[0] = T.exp2(lse_local_split[0] - lse_logsum_local[0])
-                        for i in T.Parallel(dim_v):
-                            o_accum_local[i] += po_local[i] * scale_local[0]
-                for i in T.Parallel(dim_v):
-                    Output[bz, by, i] = o_accum_local[i]
+                            Output[bid, hid, i] = o_accum_local[i]
 
         @T.prim_func
         def main_fuse(
@@ -341,8 +338,7 @@ def flashattn(batch, heads, heads_kv, dim, dim_v, fuse=False):
                 Output_partial: T.Tensor(part_shape, accum_dtype),
                 Output: T.Tensor(shape_o, dtype),
         ):
-            flash_attn_split_fuse(Q, K, V, block_indices, cache_seqlens, glse, Output_partial)
-            combine_fuse(glse, Output_partial, Output)
+            flash_attn_fused(Q, K, V, block_indices, cache_seqlens, glse, Output_partial, Output)
 
         return main_fuse if fuse else main
 
@@ -351,10 +347,11 @@ def flashattn(batch, heads, heads_kv, dim, dim_v, fuse=False):
 
 def get_configs():
     """Define the configuration space for block_H, num_stages, and threads."""
-    block_H_candidates = [64, 128]
-    num_stages_candidates = [1, 2]
-    threads_candidates = [128, 256]
-    num_split_candidates = [1, 2, 4, 8, 16]
+    block_H_candidates = [64]
+    num_stages_candidates = [2]
+    threads_candidates = [128]
+    # num_split_candidates = [1, 2, 4, 8, 16]
+    num_split_candidates = [1]
     configs = [
         {"block_H": block_H, "num_stages": num_stages, "threads": threads, "num_split": num_split}
         for block_H in block_H_candidates
@@ -438,6 +435,23 @@ class SparseFlashAttn(torch.nn.Module):
         self.kernel = best_config.kernel
         self.block_H = best_config.config['block_H']
         self.num_split = best_config.config['num_split']
+        # print(self.kernel.get_kernel_source())
+
+        # # Hacking
+        # max_selected_blocks = int(math.ceil(max_cache_seqlen * (1 - sparse_ratio) / block_size))
+        # program = flashattn(batch, heads, heads_kv, dim, dim_v, fuse)(
+        #     block_N=block_size,
+        #     block_H=64,
+        #     num_split=1,
+        #     num_stages=2,
+        #     threads=128,
+        #     # max_cache_seqlen=T.symbolic("max_cache_seqlen"),
+        #     max_cache_seqlen=max_cache_seqlen,
+        #     max_selected_blocks=max_selected_blocks)
+        # self.kernel = tilelang.compile(program, out_idx=-1)
+        # print(self.kernel.get_kernel_source())
+        # self.block_H = 64
+        # self.num_split = 1
 
     def forward(self, query, key, value, block_indices, cache_seqlens):
         batch = self.batch
@@ -592,9 +606,9 @@ def main(batch=8,
     ref = ref_program_torch(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, max_num_blocks,
                             block_size)
 
-    # sparse_kernel = SparseFlashAttn(batch, heads, heads_kv, dim, dim_v, block_size, max_cache_seqlen, sparse_ratio, fuse=False)
-    # out = sparse_kernel(Q, K, V, block_indices, cache_seqlens)
-    # debug("output", ref, out, atol=1e-3, rtol=1e-3)
+    sparse_kernel = SparseFlashAttn(batch, heads, heads_kv, dim, dim_v, block_size, max_cache_seqlen, sparse_ratio, fuse=False)
+    out = sparse_kernel(Q, K, V, block_indices, cache_seqlens)
+    debug("output", ref, out, atol=1e-3, rtol=1e-3)
 
     sparse_kernel_fuse = SparseFlashAttn(batch, heads, heads_kv, dim, dim_v, block_size, max_cache_seqlen, sparse_ratio, fuse=True)
     out_fuse = sparse_kernel_fuse(Q, K, V, block_indices, cache_seqlens)
