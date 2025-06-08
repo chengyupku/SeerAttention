@@ -230,7 +230,7 @@ def flashattn(batch, heads, heads_kv, dim, dim_v, fuse=False):
 
                 waves = T.ceildiv((batch * (heads // valid_block_H) * num_split), sm_num)
                 for wave in T.serial(waves):
-                    bid = (sm_num * wave + block_idx) // (heads // valid_block_H)
+                    bid = (sm_num * wave + block_idx) // ((heads // valid_block_H) * num_split)
                     hid = ((sm_num * wave + block_idx) // num_split) % (heads // valid_block_H)
                     sid = (sm_num * wave + block_idx) % num_split
                     cur_kv_head = hid // (kv_group_num // valid_block_H)
@@ -442,7 +442,7 @@ class SparseFlashAttn(torch.nn.Module):
         # program = flashattn(batch, heads, heads_kv, dim, dim_v, fuse)(
         #     block_N=block_size,
         #     block_H=64,
-        #     num_split=1,
+        #     num_split=2,
         #     num_stages=2,
         #     threads=128,
         #     # max_cache_seqlen=T.symbolic("max_cache_seqlen"),
@@ -451,7 +451,7 @@ class SparseFlashAttn(torch.nn.Module):
         # self.kernel = tilelang.compile(program, out_idx=-1)
         # print(self.kernel.get_kernel_source())
         # self.block_H = 64
-        # self.num_split = 1
+        # self.num_split = 2
 
     def forward(self, query, key, value, block_indices, cache_seqlens):
         batch = self.batch
